@@ -117,6 +117,14 @@ def render_video_splitter_tab():
                     key="video_url_input",
                 )
 
+                with st.expander("🔑 Tùy chọn: Cookies (Nếu gặp lỗi xác minh độ tuổi / chặn IP Cloud)", expanded=False):
+                    st.caption("Nếu video yêu cầu đăng nhập hoặc bị YouTube chặn IP của Google Colab, bạn có thể xuất file `cookies.txt` từ trình duyệt và tải lên đây:")
+                    uploaded_cookie = st.file_uploader("Tải file cookies.txt:", type=["txt"], key="cookie_uploader_splitter")
+                    if uploaded_cookie is not None:
+                        with open("cookies.txt", "wb") as cf:
+                            cf.write(uploaded_cookie.getvalue())
+                        st.success("✅ Đã nạp cookies.txt thành công! yt-dlp sẽ tự động dùng cookies này.")
+
                 dl_btn = st.button(
                     "📥  Tải Video",
                     use_container_width=True,

@@ -692,14 +692,46 @@ def download_video_from_url(
         if node_bin:
             base_opts['js_runtimes'] = {'node': {'path': node_bin}}
 
-        # Danh sách chiến lược tải thích ứng 1080p siêu tốc (Ưu tiên Direct Native trước, không bị delay tìm cookies)
+        cookie_file = None
+        for c_cand in ["cookies.txt", "/content/cookies.txt"]:
+            if os.path.exists(c_cand):
+                cookie_file = c_cand
+                break
+
+        # Danh sách chiến lược tải thích ứng 1080p siêu tốc (Ưu tiên Direct Native trước, sau đó là Android/iOS client bypass bot-check trên Cloud/Colab)
         download_strategies = []
         if is_youtube:
+            cookie_kwargs = {"cookiefile": cookie_file} if cookie_file else {}
             download_strategies.extend([
                 {
                     "name": "YouTube Siêu Tốc 1080p (Direct)",
                     "opts": {
                         "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                        **cookie_kwargs
+                    }
+                },
+                {
+                    "name": "YouTube Android Client (Bypass Xác Minh Bot / IP Cloud)",
+                    "opts": {
+                        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                        "extractor_args": {
+                            "youtube": {
+                                "player_client": ["android", "ios"]
+                            }
+                        },
+                        **cookie_kwargs
+                    }
+                },
+                {
+                    "name": "YouTube iOS Client (Mobile Direct)",
+                    "opts": {
+                        "format": "best[height<=1080]/best",
+                        "extractor_args": {
+                            "youtube": {
+                                "player_client": ["ios", "mweb"]
+                            }
+                        },
+                        **cookie_kwargs
                     }
                 },
                 {
@@ -720,6 +752,7 @@ def download_video_from_url(
                     "name": "YouTube Fallback 1080p",
                     "opts": {
                         "format": "best[height<=1080]/best",
+                        **cookie_kwargs
                     }
                 }
             ])
