@@ -698,39 +698,39 @@ def download_video_from_url(
                 cookie_file = c_cand
                 break
 
-        # Danh sách chiến lược tải thích ứng 1080p siêu tốc (Ưu tiên Direct Native trước, sau đó là Android/iOS client bypass bot-check trên Cloud/Colab)
+        # Danh sách chiến lược tải thích ứng 1080p siêu tốc (Ưu tiên Android VR & Web Embedded để tự động vượt xác minh độ tuổi / bot trên Colab)
         download_strategies = []
         if is_youtube:
             cookie_kwargs = {"cookiefile": cookie_file} if cookie_file else {}
             download_strategies.extend([
                 {
+                    "name": "YouTube Android VR (Auto-Bypass Tuổi & Bot 1080p)",
+                    "opts": {
+                        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                        "extractor_args": {
+                            "youtube": {
+                                "player_client": ["android_vr", "web_embedded"]
+                            }
+                        },
+                        **cookie_kwargs
+                    }
+                },
+                {
+                    "name": "YouTube Web Embedded (Bypass Xác Minh 1080p)",
+                    "opts": {
+                        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+                        "extractor_args": {
+                            "youtube": {
+                                "player_client": ["web_embedded"]
+                            }
+                        },
+                        **cookie_kwargs
+                    }
+                },
+                {
                     "name": "YouTube Siêu Tốc 1080p (Direct)",
                     "opts": {
                         "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-                        **cookie_kwargs
-                    }
-                },
-                {
-                    "name": "YouTube Android Client (Bypass Xác Minh Bot / IP Cloud)",
-                    "opts": {
-                        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-                        "extractor_args": {
-                            "youtube": {
-                                "player_client": ["android", "ios"]
-                            }
-                        },
-                        **cookie_kwargs
-                    }
-                },
-                {
-                    "name": "YouTube iOS Client (Mobile Direct)",
-                    "opts": {
-                        "format": "best[height<=1080]/best",
-                        "extractor_args": {
-                            "youtube": {
-                                "player_client": ["ios", "mweb"]
-                            }
-                        },
                         **cookie_kwargs
                     }
                 },
@@ -853,6 +853,79 @@ def download_video_from_url(
                 except Exception as e_strat:
                     last_exception = e_strat
                     continue
+
+            if not download_success and is_youtube:
+                from utils.youtube_bypass import (
+                    extract_youtube_id,
+                    ensure_colab_warp_proxy,
+                    download_via_pytubefix,
+                    download_via_cloud_mirrors,
+                )
+
+                # Stage A: Try pytubefix multi-client bypass (ANDROID_VR / WEB_EMBED / MWEB)
+                clean_output_dir()
+                pt_res = download_via_pytubefix(
+                    clean_url,
+                    output_dir,
+                    audio_only=audio_only,
+                    ui_updater=ui_updater
+                )
+                if pt_res.get("success"):
+                    download_success = True
+
+                # Stage B: Auto-activate Cloudflare WARP SOCKS5 Proxy on Colab & retry yt-dlp + pytubefix
+                if not download_success:
+                    warp_proxy = ensure_colab_warp_proxy(port=40000, ui_updater=ui_updater)
+                    if warp_proxy:
+                        for warp_client in [["android_vr", "web_embedded"], ["web_embedded"], None]:
+                            clean_output_dir()
+                            ydl_warp_opts = dict(base_opts)
+                            ydl_warp_opts["proxy"] = warp_proxy
+                            if warp_client:
+                                ydl_warp_opts["extractor_args"] = {"youtube": {"player_client": warp_client}}
+                            if audio_only:
+                                ydl_warp_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+                                ydl_warp_opts.pop("merge_output_format", None)
+                            try:
+                                ui_updater(
+                                    status_text="🛡️ [WARP Clean IP] Đang tải video qua đường truyền Cloudflare WARP...",
+                                    pct_val=15.0,
+                                    speed_str="WARP Tunnel...",
+                                    phase="downloading"
+                                )
+                                with yt_dlp.YoutubeDL(ydl_warp_opts) as ydl:
+                                    ydl.download([clean_url])
+                                download_success = True
+                                break
+                            except Exception as e_w:
+                                last_exception = e_w
+                                continue
+
+                        if not download_success:
+                            clean_output_dir()
+                            pt_warp = download_via_pytubefix(
+                                clean_url,
+                                output_dir,
+                                audio_only=audio_only,
+                                proxies={"http": warp_proxy, "https": warp_proxy},
+                                ui_updater=ui_updater
+                            )
+                            if pt_warp.get("success"):
+                                download_success = True
+
+                # Stage C: Public Cloud Mirror APIs (Piped / Invidious)
+                if not download_success:
+                    yt_id = extract_youtube_id(clean_url)
+                    if yt_id:
+                        clean_output_dir()
+                        mirror_res = download_via_cloud_mirrors(
+                            yt_id,
+                            output_dir,
+                            audio_only=audio_only,
+                            ui_updater=ui_updater
+                        )
+                        if mirror_res.get("success"):
+                            download_success = True
 
             if not download_success:
                 if last_exception:

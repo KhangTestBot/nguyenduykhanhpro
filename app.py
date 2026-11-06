@@ -178,6 +178,20 @@ def main():
                 """,
                 unsafe_allow_html=True,
             )
+            if st.button("🔄 Cập Nhật App Từ GitHub (1-Click)", use_container_width=True, key="sidebar_git_pull_btn"):
+                import importlib, sys
+                res_pull = subprocess.run(["git", "pull", "origin", "main"], capture_output=True, text=True)
+                for mod_name in list(sys.modules.keys()):
+                    if mod_name.startswith(("features.", "utils.")):
+                        try:
+                            importlib.reload(sys.modules[mod_name])
+                        except Exception:
+                            pass
+                st.toast("✅ Đã cập nhật code mới nhất từ GitHub!", icon="🚀")
+                st.success(f"Đã cập nhật: {res_pull.stdout.strip() or 'Bản mới nhất'}")
+                time.sleep(0.6)
+                st.rerun()
+
             if st.button("🧹 Dọn Sạch File Tạm / Cache", use_container_width=True, key="sidebar_clean_cache_btn"):
                 n_del, mb_freed = cleanup_output_caches()
                 st.toast(f"Đã xóa {n_del} file tạm, giải phóng {mb_freed:.1f} MB!", icon="🧹")
