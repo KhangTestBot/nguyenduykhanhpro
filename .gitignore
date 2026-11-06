@@ -1,0 +1,55 @@
+# Secrets & Environment
+.env
+.venv/
+venv/
+ENV/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated Outputs & Heavy Media (8.6+ GB)
+output_clips/
+output_voiceovers/
+output_videos/
+output_vocal_separation/
+output_v2v_videos/
+google_flow_output/
+google_flow_references/
+logs/
+scratch/
+test_frames/
+verified_frames/
+final_frames/
+ai_photoreal_frames/
+pure_stock_test/
+pexels_verified/
+test_media/
+
+# Video & Archive Binaries
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.zip
+
+# Unrelated one-off scripts & screenshots in root
+pearson_*.js
+*.user.js
+auto_survey_shopee.py
+create_spider.py
+compact_414.json
+clue*.png
+crop_*.png
+cw_*.png
+ey_area.png
+grid_lines.png
+label_*.png
+universal-exercise-agent/
+wedding-invitation/
+
+# OS Metadata
+.DS_Store
+Thumbs.db

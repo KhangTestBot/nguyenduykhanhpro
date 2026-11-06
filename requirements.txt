@@ -1,0 +1,8 @@
+ffmpeg-python>=0.2.0
+tqdm>=4.66.0
+playwright>=1.40.0
+streamlit-autorefresh>=1.0.1
+requests>=2.31.0
+soundfile>=0.12.1
+# OmniVoice (khuyên dùng trên Colab có GPU):
+# pip install omnivoice torch torchaudio
