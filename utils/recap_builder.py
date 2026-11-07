@@ -116,23 +116,37 @@ def format_seconds_to_mmss(seconds: float) -> str:
 
 def create_lightweight_ai_proxy(video_path: Path, output_proxy_path: Path) -> Path:
     """
-    Tạo nhanh bản video proxy 360p siêu nhẹ (mono audio, CRF 32) giữ nguyên 100% framerate & timeline gốc
-    để gửi lên Gemini File API với tốc độ cực nhanh mà không bị lỗi socket/broken pipe.
+    Tạo nhanh bản video proxy siêu nhẹ giữ nguyên 100% timeline gốc (mốc giây chính xác tuyệt đối)
+    để gửi lên Gemini File API với tốc độ cực nhanh, tối ưu đặc biệt cho phim dài 1.5 - 3 tiếng.
+    (Khi xuất video Master ở Bước 2, hệ thống vẫn cắt từ file gốc 1080p 30fps sắc nét).
     """
     ffmpeg_exe = get_ffmpeg_cmd()
+    dur = get_video_duration(video_path)
+    # Gemini xử lý chuẩn ở 1-2 FPS; giảm FPS trên bản Proxy cho phim dài giúp nén phim 2 tiếng chỉ mất ~30 giây!
+    if dur > 1800:  # Phim dài > 30 phút (ví dụ 1.5 - 3 tiếng)
+        vf_str = "fps=2,scale='min(426,iw)':-2:flags=fast_bilinear,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+        audio_br = "32k"
+    elif dur > 600:
+        vf_str = "fps=4,scale='min(480,iw)':-2:flags=fast_bilinear,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+        audio_br = "40k"
+    else:
+        vf_str = "scale='min(480,iw)':-2:flags=fast_bilinear,pad=ceil(iw/2)*2:ceil(ih/2)*2"
+        audio_br = "48k"
+
     cmd = [
         ffmpeg_exe, "-y",
         "-i", str(video_path),
-        "-vf", "scale='min(480,iw)':-2:flags=fast_bilinear,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-vf", vf_str,
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "32",
+        "-crf", "33",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
-        "-b:a", "48k",
+        "-b:a", audio_br,
         "-ac", "1",
+        "-ar", "16000",
         "-movflags", "+faststart",
-        "-threads", "4",
+        "-threads", "0",
         str(output_proxy_path)
     ]
     try:
@@ -410,14 +424,14 @@ def analyze_and_generate_recap(
             except Exception as final_e:
                 return {"success": False, "error": f"Lỗi kết nối gửi video lên AI: {str(final_e or last_upload_err)}"}
 
-        max_wait = 180
+        max_wait = 360
         waited = 0
         while video_file.state.name == "PROCESSING" and waited < max_wait:
             time.sleep(2)
             waited += 2
             video_file = genai.get_file(video_file.name)
             if progress_callback:
-                progress_callback(15 + int((waited / max_wait) * 20), f"🤖 AI đang giải mã bối cảnh và diễn biến video ({waited}s)...")
+                progress_callback(15 + int((waited / max_wait) * 20), f"🤖 AI đang giải mã bối cảnh và diễn biến bộ phim ({waited}s)...")
 
         # Tính số lượng phân cảnh và độ dài từng cảnh theo đúng mục tiêu thời lượng
         if recap_mode == "votritv_comedy":
@@ -781,8 +795,8 @@ Bạn PHẢI trả về duy nhất một JSON Array hợp lệ gồm đúng {act
                             "temperature": 0.30,
                         }
                     )
-                    # Giới hạn timeout 75s để tránh nghẽn socket nếu Google quá tải
-                    resp = model_inst.generate_content([video_file, act_prompt], request_options={"timeout": 75})
+                    # Giới hạn timeout 150s hỗ trợ phân tích phim dài 2-3 tiếng
+                    resp = model_inst.generate_content([video_file, act_prompt], request_options={"timeout": 150})
                     if resp and resp.text:
                         act_resp_txt = resp.text.strip()
                         break
