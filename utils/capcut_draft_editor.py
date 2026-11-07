@@ -3,7 +3,10 @@ import json
 import uuid
 import shutil
 from pathlib import Path
-import pysrt
+try:
+    import pysrt
+except ImportError:
+    pysrt = None
 
 def get_mac_capcut_projects():
     """

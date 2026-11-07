@@ -196,12 +196,144 @@ def generate_segment_thumbnails(video_path: Path, segments: list, output_dir: Pa
     return [r[1] for r in sorted(results, key=lambda x: x[0])]
 
 
+def create_circular_logo_badge(logo_input_path: Path, output_png_path: Path, size: int = 116) -> Optional[Path]:
+    """
+    Chuyển đổi ảnh Logo/Avatar kênh bất kỳ thành huy hiệu tròn (Circular Badge) có viền đôi sắc nét
+    chuẩn phong cách góc trái-trên của kênh 'Não Động Review' để đính lên video.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageOps
+        img = Image.open(logo_input_path).convert("RGBA")
+        # Crop vuông ở tâm và resize mượt
+        img = ImageOps.fit(img, (size, size), method=Image.Resampling.LANCZOS)
+
+        # Tạo mask tròn khử răng cưa (supersampling 4x)
+        scale = 4
+        big_sz = size * scale
+        mask = Image.new("L", (big_sz, big_sz), 0)
+        draw_m = ImageDraw.Draw(mask)
+        draw_m.ellipse((8 * scale, 8 * scale, big_sz - 8 * scale, big_sz - 8 * scale), fill=255)
+        mask = mask.resize((size, size), Image.Resampling.LANCZOS)
+
+        # Tạo nền huy hiệu tròn có viền cam đào / vàng hồng + viền trắng chuẩn Não Động Review
+        badge = Image.new("RGBA", (big_sz, big_sz), (0, 0, 0, 0))
+        draw_b = ImageDraw.Draw(badge)
+        # Vòng ngoài màu cam san hô ấm (Coral/Salmon border)
+        draw_b.ellipse((2, 2, big_sz - 2, big_sz - 2), fill=(242, 139, 130, 245))
+        # Vòng nhẫn trắng tinh tế bên trong
+        draw_b.ellipse((5 * scale, 5 * scale, big_sz - 5 * scale, big_sz - 5 * scale), fill=(255, 248, 231, 255))
+        badge = badge.resize((size, size), Image.Resampling.LANCZOS)
+
+        badge.paste(img, (0, 0), mask)
+        output_png_path.parent.mkdir(parents=True, exist_ok=True)
+        badge.save(output_png_path, format="PNG")
+        if output_png_path.exists() and output_png_path.stat().st_size > 100:
+            return output_png_path
+    except Exception:
+        pass
+    return None
+
+
+def parse_srt_entries(srt_text: str) -> List[Dict[str, Any]]:
+    """Phân tích nội dung file phụ đề .SRT hoặc .VTT thành danh sách các câu thoại có mốc giây."""
+    if not srt_text or not srt_text.strip():
+        return []
+    entries = []
+    blocks = re.split(r'\n\s*\n', srt_text.strip())
+    time_pat = re.compile(r'(\d{1,2}:\d{2}:\d{2}[.,]\d+|\d{1,2}:\d{2}[.,]\d+)\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d+|\d{1,2}:\d{2}[.,]\d+)')
+    for b in blocks:
+        lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        m = None
+        time_line_idx = -1
+        for i, ln in enumerate(lines):
+            m = time_pat.search(ln)
+            if m:
+                time_line_idx = i
+                break
+        if m and time_line_idx != -1:
+            st_raw = m.group(1).replace(",", ".")
+            en_raw = m.group(2).replace(",", ".")
+            st_s = parse_time_to_seconds(st_raw, 0.0)
+            en_s = parse_time_to_seconds(en_raw, st_s + 2.0)
+            txt_lines = lines[time_line_idx + 1:]
+            clean_txt = re.sub(r'<[^>]+>', '', " ".join(txt_lines)).strip()
+            if clean_txt:
+                entries.append({"start": st_s, "end": en_s, "text": clean_txt})
+    return entries
+
+
+def get_srt_snippet_for_window(srt_entries: List[Dict[str, Any]], start_s: float, end_s: float, max_chars: int = 3500) -> str:
+    """Lấy phần phụ đề gốc nằm trong khoảng [start_s, end_s] để giúp AI nắm chuẩn 100% tên nhân vật & cốt truyện."""
+    if not srt_entries:
+        return ""
+    matched = []
+    cur_len = 0
+    for e in srt_entries:
+        if e["end"] >= start_s and e["start"] <= end_s:
+            line = f"[{format_seconds_to_mmss(e['start'])}] {e['text']}"
+            if cur_len + len(line) > max_chars:
+                break
+            matched.append(line)
+            cur_len += len(line) + 1
+    return "\n".join(matched)
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    """Định dạng số giây sang chuẩn SRT HH:MM:SS,mmm."""
+    seconds = max(0.0, float(seconds))
+    total_sec = int(seconds)
+    millis = int(round((seconds - total_sec) * 1000))
+    if millis >= 1000:
+        total_sec += 1
+        millis -= 1000
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d},{millis:03d}"
+
+
+def export_synced_srt_file(segments: list, scene_durations: Dict[int, float], output_srt_path: Path) -> Optional[Path]:
+    """Tạo file phụ đề .SRT khớp chính xác 100% với thời lượng thực tế của từng phân cảnh sau khi render."""
+    try:
+        lines = []
+        cur_time = 0.0
+        sub_idx = 1
+        for i, seg in enumerate(segments):
+            dur = scene_durations.get(i, float(seg.get("duration", 5.0)))
+            script_txt = seg.get("script", "").strip()
+            if script_txt:
+                # Chia câu dài thành các câu nhỏ vừa mắt người đọc phụ đề YouTube
+                sentences = [s.strip() for s in re.split(r'(?<=[.!?।])\s+', script_txt) if s.strip()]
+                if not sentences:
+                    sentences = [script_txt]
+                total_words = sum(max(1, len(s.split())) for s in sentences)
+                seg_cur = cur_time
+                for s_i, sent in enumerate(sentences):
+                    w_cnt = max(1, len(sent.split()))
+                    part_dur = dur * (w_cnt / total_words) if s_i < len(sentences) - 1 else (cur_time + dur - seg_cur)
+                    part_dur = max(0.8, part_dur)
+                    st_str = format_srt_timestamp(seg_cur)
+                    en_str = format_srt_timestamp(min(cur_time + dur, seg_cur + part_dur))
+                    lines.append(f"{sub_idx}\n{st_str} --> {en_str}\n{sent}\n")
+                    sub_idx += 1
+                    seg_cur += part_dur
+            cur_time += dur
+        output_srt_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_srt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return output_srt_path
+    except Exception:
+        return None
+
+
 def analyze_and_generate_recap(
     video_path: Path,
     target_duration_sec: Optional[float] = None,
     target_ratio: float = 0.30,
     target_lang_name: str = "Tiếng Việt",
-    style: str = "🎬 Review Phim / Kịch Tính & Lôi Cuốn",
+    style: str = "🔥 Review Phim Chuyên Sâu (Chuẩn Kênh Não Động Review)",
     movie_title: str = "",
     character_hints: str = "",
     model_name: str = "models/gemini-flash-latest",
@@ -210,12 +342,17 @@ def analyze_and_generate_recap(
     recap_mode: str = "movie_recap",
     votri_style: str = "max_absurd",
     custom_catchphrases: str = "",
+    srt_text: str = "",
+    include_cold_open_hook: bool = True,
+    include_deep_moral_outro: bool = True,
     progress_callback: Optional[Callable[[int, str], None]] = None
 ) -> Dict[str, Any]:
     """
-    Sử dụng Gemini Model (2.5 Flash, 3.7 Flash) phân tích video với thuật toán Neo Hình Ảnh Thực Tế (Visual Grounding),
+    Sử dụng Gemini Model phân tích video với thuật toán Neo Hình Ảnh Thực Tế (Visual Grounding),
     tự động bóc tách các đoạn highlight và viết kịch bản thuyết minh khớp 100% với từng khung hình.
-    Hỗ trợ 2 chế độ:
+    Hỗ trợ chuyên sâu:
+    - Phong cách 'Não Động Review': Kể chuyện liền mạch đa hồi (15-25 phút), phân tích tâm lý/cơ chế ngầm,
+      mở đầu Cold Open giật gân và kết thúc bằng Thông điệp Nhân sinh / Cảnh giác sâu sắc.
     - movie_recap: Review phim / Tóm tắt cốt truyện điện ảnh kịch tính theo Hồi (Acts).
     - votritv_comedy: Tuyển tập Clip Hài Hước / Vô Tri TV theo chuẩn phong cách kênh @78votritv.
     """
@@ -237,6 +374,7 @@ def analyze_and_generate_recap(
 
     total_dur_str = format_seconds_to_mmss(total_dur)
     target_dur_str = format_seconds_to_mmss(target_duration_sec)
+    srt_entries = parse_srt_entries(srt_text) if srt_text else []
 
     proxy_temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -292,31 +430,31 @@ def analyze_and_generate_recap(
             avg_seg_dur = max(2.5, round(total_dur / num_segments, 1))
             min_seg_dur = 2.0
             max_seg_dur = max(4.0, round(avg_seg_dur * 1.5, 1))
-            # Tốc độ nói của giọng Thanh Niên Tự Tin: ~3.1 từ / giây
             target_words = max(8, min(24, int(avg_seg_dur * 3.1)))
             min_words = max(6, int(target_words * 0.7))
             max_words = int(target_words * 1.35)
         else:
-            # Chế độ Review Phim / Cinematic
+            # Chế độ Review Phim / Chuẩn Kênh Não Động Review
             if custom_num_segments and int(custom_num_segments) > 0:
-                num_segments = max(4, min(150, int(custom_num_segments)))
+                num_segments = max(4, min(180, int(custom_num_segments)))
             else:
                 if target_duration_sec <= 180:
-                    num_segments = max(6, min(20, int(target_duration_sec / 8.5)))
+                    num_segments = max(8, min(22, int(target_duration_sec / 8.0)))
                 elif target_duration_sec <= 480:
-                    num_segments = max(16, min(36, int(target_duration_sec / 11.5)))
-                elif target_duration_sec <= 1200:
-                    num_segments = max(30, min(60, int(target_duration_sec / 14.0)))
+                    num_segments = max(20, min(42, int(target_duration_sec / 10.5)))
+                elif target_duration_sec <= 900:
+                    num_segments = max(40, min(75, int(target_duration_sec / 12.0)))
                 else:
-                    num_segments = max(50, min(120, int(target_duration_sec / 16.0)))
+                    # Phim dài Review Chuyên Sâu 15 - 25 phút chuẩn Não Động Review (80 - 150 phân cảnh)
+                    num_segments = max(65, min(150, int(target_duration_sec / 12.5)))
 
-            avg_seg_dur = max(5.0, round(target_duration_sec / num_segments, 1))
+            avg_seg_dur = max(5.0, min(22.0, round(target_duration_sec / num_segments, 1)))
             min_seg_dur = max(4.0, round(avg_seg_dur * 0.75, 1))
             max_seg_dur = round(avg_seg_dur * 1.35, 1)
-            # Tốc độ nói chuẩn của Cô Gái Hoạt Ngôn: ~3.1 từ / giây
-            target_words = max(18, min(65, int(avg_seg_dur * 3.1)))
-            min_words = max(12, int(target_words * 0.8))
-            max_words = int(target_words * 1.2)
+            # Tốc độ nói chuẩn của giọng Review Phim (Não Động Review): ~3.15 từ / giây
+            target_words = max(18, min(75, int(avg_seg_dur * 3.15)))
+            min_words = max(14, int(target_words * 0.82))
+            max_words = int(target_words * 1.22)
 
         movie_context_prompt = ""
         if movie_title.strip() or character_hints.strip():
@@ -324,15 +462,15 @@ def analyze_and_generate_recap(
 THÔNG TIN TÁC PHẨM & NHÂN VẬT:
 - Tên Phim / Video: {movie_title.strip() if movie_title.strip() else 'Theo cốt truyện video'}
 - Danh Sách Nhân Vật & Tên Gọi: {character_hints.strip() if character_hints.strip() else 'Tự động tra cứu theo phim'}
-- QUY TẮC BẮT BUỘC: Bạn PHẢI nhận diện chính xác từng nhân vật xuất hiện trên màn hình và GỌI ĐÚNG TÊN NHÂN VẬT trong toàn bộ kịch bản thuyết minh. Tuyệt đối KHÔNG gọi chung chung là 'chàng trai', 'cô gái', 'người đàn ông' khi đã có tên nhân vật!
+- QUY TẮC BẮT BUỘC: Bạn PHẢI nhận diện chính xác từng nhân vật xuất hiện trên màn hình và GỌI ĐÚNG TÊN NHÂN VẬT trong toàn bộ kịch bản thuyết minh. Tuyệt đối KHÔNG gọi chung chung là 'chàng trai', 'cô gái', 'người đàn ông' khi đã biết tên nhân vật!
 """
 
-        # Phân chia theo Hồi (Timeline Acts) nếu số lượng phân cảnh lớn (> 28 scenes)
+        # Phân chia theo Hồi (Timeline Acts) hỗ trợ tới 8 Hồi cho Review Phim Chuyên Sâu 15-25 phút
         acts_plan = []
-        if num_segments <= 28:
+        if num_segments <= 24:
             acts_plan = [(0.0, total_dur, num_segments, 1, 1)]
         else:
-            num_acts = min(5, max(2, math.ceil(num_segments / 24.0)))
+            num_acts = min(8, max(2, math.ceil(num_segments / 22.0)))
             act_dur = total_dur / num_acts
             base_segs = num_segments // num_acts
             rem_segs = num_segments % num_acts
@@ -359,6 +497,7 @@ THÔNG TIN TÁC PHẨM & NHÂN VẬT:
 
         raw_all_segments = []
         total_acts_count = len(acts_plan)
+        is_naodong_style = ("não động" in style.lower()) or ("chuyên sâu" in style.lower()) or (recap_mode == "naodong_review")
 
         for act_st, act_et, act_segs, act_num, total_acts in acts_plan:
             act_st_str = format_seconds_to_mmss(act_st)
@@ -368,9 +507,31 @@ THÔNG TIN TÁC PHẨM & NHÂN VẬT:
             if progress_callback:
                 if total_acts > 1:
                     pct_val = 35 + int((act_num - 1) / total_acts * 45)
-                    progress_callback(pct_val, f"✍️ AI ({active_disp_model}) đang phân tích kịch bản Hồi {act_num}/{total_acts} ({act_st_str} ➔ {act_et_str}) gồm {act_segs} phân cảnh...")
+                    progress_callback(pct_val, f"✍️ AI ({active_disp_model}) đang biên kịch Hồi {act_num}/{total_acts} ({act_st_str} ➔ {act_et_str}) gồm {act_segs} phân cảnh...")
                 else:
                     progress_callback(40, f"✍️ AI ({active_disp_model}) đang lên kịch bản thuyết minh và chọn lọc {act_segs} phân cảnh Highlight...")
+
+            # Ngữ cảnh nối tiếp từ Hồi trước để câu chuyện liền mạch 100% không đứt quãng
+            prev_continuity_note = ""
+            if raw_all_segments:
+                last_two = raw_all_segments[-2:]
+                prev_scripts = " | ".join([s.get("script", "") for s in last_two if s.get("script")])
+                if prev_scripts:
+                    prev_continuity_note = f"""
+MẠCH TRUYỆN LIỀN TRƯỚC (HỒI {act_num - 1}):
+"{prev_scripts}"
+➔ YÊU CẦU LIỀN MẠCH TUYỆT ĐỐI: Phân cảnh đầu tiên của Hồi {act_num} PHẢI nối tiếp tự nhiên mạch chuyện trên (dùng các từ chuyển đoạn như 'Lúc này...', 'Thế nhưng...', 'Ngay sau đó...', 'Trong khi đó...', 'Hóa ra...'). TUYỆT ĐỐI KHÔNG mở bài lại từ đầu!
+"""
+
+            # Trích xuất phụ đề gốc (nếu có) trong khung giờ của Hồi hiện tại
+            srt_window_context = ""
+            if srt_entries:
+                sub_snippet = get_srt_snippet_for_window(srt_entries, act_st, act_et, max_chars=3500)
+                if sub_snippet:
+                    srt_window_context = f"""
+PHỤ ĐỀ / LỜI THOẠI GỐC TRONG ĐOẠN [{act_st_str} - {act_et_str}] (Dùng để lấy chính xác tên nhân vật, địa danh, tình tiết):
+{sub_snippet}
+"""
 
             if recap_mode == "votritv_comedy":
                 # Tùy biến phân cấp phong cách Vô Tri theo chuẩn kênh @78votritv
@@ -521,30 +682,64 @@ Bạn PHẢI trả về duy nhất một JSON Array hợp lệ gồm các phân 
 ]
 """
             else:
+                act_role_instruction = ""
+                if act_num == 1 and include_cold_open_hook:
+                    act_role_instruction = """
+🔥 YÊU CẦU ĐẶC BIỆT CHO HỒI MỞ ĐẦU (COLD OPEN HOOK CHUẨN KÊNH 'NÃO ĐỘNG REVIEW'):
+- Phân cảnh #1 và #2 PHẢI mở màn trực diện vào bầu không khí căng thẳng, bí ẩn hoặc xung đột đắt giá nhất (Ví dụ mẫu chuẩn Não Động Review: 'Nơi này nằm ở một khu vực vô cùng hoang vắng, gần như tách biệt hoàn toàn với thế giới bên ngoài, nhưng lại được quản lý và canh gác cực kỳ nghiêm ngặt... Tuy nhiên, ngay sau đó, một tiếng súng vang lên khiến tất cả mọi người có mặt lập tức im bặt...').
+- Tuyệt đối KHÔNG mở đầu nhạt nhẽo kiểu 'Xin chào các bạn, hôm nay chúng ta cùng xem phim...'. Hãy cuốn người xem vào thẳng thế giới của bộ phim ngay từ giây đầu tiên, sau đó dẫn dắt mượt mà vào nhân vật chính và nguyên nhân khởi nguồn câu chuyện!
+"""
+                elif act_num == total_acts and include_deep_moral_outro:
+                    act_role_instruction = """
+🌟 YÊU CẦU ĐẶC BIỆT CHO HỒI KẾT (CAO TRÀO & THÔNG ĐIỆP CHIỀU SÂU CHUẨN 'NÃO ĐỘNG REVIEW'):
+- Các phân cảnh đầu và giữa Hồi này: Đẩy kịch tính lên đỉnh điểm để giải quyết nút thắt cuối cùng của bộ phim.
+- RIÊNG 1-2 PHÂN CẢNH CUỐI CÙNG CỦA HỒI NÀY: Sau khi khép lại số phận các nhân vật, BẮT BUỘC phải lồng ghép phần đúc kết THÔNG ĐIỆP NHÂN SINH / BÀI HỌC CẢNH GIÁC SÂU SẮC chuẩn phong cách kênh 'Não Động Review' (Ví dụ mẫu chuẩn: 'Thông điệp cuối cùng mà nội dung muốn nhấn mạnh là thay vì chỉ trông chờ vào may mắn sau khi hậu quả đã xảy ra, mỗi người trước hết cần tự nâng cao cảnh giác... Nhiều chiếc bẫy không khiến nạn nhân mất tất cả ngay từ bước đầu, chúng thường cố tình cho người ta một chút lợi ích, một chút hy vọng để khiến người đó tin rằng mình đang kiểm soát tình hình...').
+"""
+                else:
+                    act_role_instruction = f"""
+🎬 YÊU CẦU ĐẶC BIỆT CHO HỒI {act_num}/{total_acts} (PHÁT TRIỂN XUNG ĐỘT & BÓC TÁCH CHIỀU SÂU):
+- Tiếp nối liền mạch 100% từ Hồi trước, đẩy cao mâu thuẫn, bóc tách rõ tâm lý nhân vật, các bước ngoặt (plot twists) và cơ chế hoạt động ngầm đằng sau các sự kiện trong phim.
+"""
+
+                naodong_master_guide = ""
+                if is_naodong_style:
+                    naodong_master_guide = """
+══════════════════════════════════════════════════════════════════════
+BÍ QUYẾT BIÊN KỊCH TRIỆU VIEW CHUẨN KÊNH "NÃO ĐỘNG REVIEW" (BẮT BUỘC TUÂN THỦ):
+══════════════════════════════════════════════════════════════════════
+1. **GIỌNG VĂN KỂ CHUYỆN TOÀN TRI, SẮC SẢO & LIỀN MẠCH NHƯ TIỂU THUYẾT**:
+   - Sử dụng ngôi thứ ba toàn tri điềm đạm, khách quan, giàu tính phân tích tâm lý và xã hội.
+   - TUYỆT ĐỐI KHÔNG viết rời rạc từng câu cụt ngủn. Toàn bộ các phân cảnh phải nối kết với nhau thành MỘT DÒNG CHẢY KỂ CHUYỆN LIÊN TỤC bằng các từ nối tự nhiên ('Tuy nhiên, ngay sau đó...', 'Sau khi...', 'Ở cấp độ cao hơn...', 'Lúc này...', 'Dĩ nhiên...', 'Không ai ngờ rằng...', 'Thế nhưng...').
+2. **VỪA KHỚP HÌNH ẢNH 100%, VỪA GIẢI THÍCH BẢN CHẤT & ĐỘNG CƠ NGẦM**:
+   - Không chỉ tả bề mặt ('anh ta ngồi trước máy tính'), mà phải giải thích Ý NGHĨA CỦA HÀNH ĐỘNG ĐÓ TRONG CỐT TRUYỆN ('Trong căn phòng tối tăm và ngột ngạt, hàng loạt người đàn ông chen chúc trước máy tính. Công việc của họ là sử dụng hàng chục tài khoản ảo để tiếp cận con mồi và phát tán đường link lừa đảo...').
+"""
+
                 act_prompt = f"""
-Bạn là một Đạo diễn & Biên kịch Top 1 YouTube/TikTok Movie Recap & Review Phim triệu view.
-Nhiệm vụ: Trích xuất các phân cảnh highlight đắt giá nhất và viết kịch bản thuyết minh ĐỒNG BỘ CHUẨN XÁC 100% VỚI HÌNH ẢNH VIDEO.
+Bạn là Tổng Biên Tập & Biên Kịch Trưởng của kênh YouTube Review Phim triệu view "Não Động Review".
+Nhiệm vụ: Trích xuất các phân cảnh đắt giá nhất và viết kịch bản thuyết minh Review Phim chuyên sâu, cuốn hút, ĐỒNG BỘ CHUẨN XÁC 100% VỚI HÌNH ẢNH VIDEO.
 Phong cách biên kịch: {style}.
 Ngôn ngữ kịch bản bắt buộc: {target_lang_name}.
 Thời lượng video gốc: {total_dur_str} ({total_dur:.1f} giây).
 HỒI HIỆN TẠI (PHÂN ĐOẠN {act_num}/{total_acts}): Khung thời gian từ {act_st_str} ({act_st:.1f}s) đến {act_et_str} ({act_et:.1f}s).
 YÊU CẦU: CHỌN LỌC VÀ VIẾT ĐÚNG {act_segs} PHÂN CẢNH NẰM TRONG KHOẢNG [{act_st_str} - {act_et_str}].
 {movie_context_prompt}
+{prev_continuity_note}
+{srt_window_context}
+{act_role_instruction}
+{naodong_master_guide}
 
 ══════════════════════════════════════════════════════════════════════
 QUY TẮC BẮT BUỘC VỀ ĐỒNG BỘ HÌNH ẢNH & LỜI THOẠI (VISUAL-TO-SCRIPT GROUNDING):
 ══════════════════════════════════════════════════════════════════════
 1. **NEO HÌNH ẢNH THỰC TẾ TRỰC QUAN (`visual_action`)**:
-   - Bạn PHẢI quan sát trực tiếp khung hình video tại `start_time` và ghi rõ hành động, nhân vật, đạo cụ đang xuất hiện.
-   - Ví dụ: 'John bước vào căn hầm bí mật và cầm chiếc vali chứa bản đồ', 'Cô gái giật mình khi nghe tiếng gõ cửa'.
+   - Bạn PHẢI quan sát trực tiếp khung hình video tại `start_time` và ghi rõ hành động, bối cảnh, nhân vật đang xuất hiện.
 
 2. **LỜI THUYẾT MINH PHẢI NÓI TRỰC TIẾP VỀ HÌNH ẢNH ĐANG CHIẾU (`script`)**:
-   - Lời thoại BẮT BUỘC PHẢI THUYẾT MINH CHÍNH XÁC VỀ HÀNH ĐỘNG/SỰ KIỆN đang xuất hiện trên màn hình tại phân cảnh đó.
-   - Khi video chiếu cảnh nhân vật cầm súng, lời thoại phải nói về khẩu súng hoặc hành động rút súng của nhân vật.
-   - TUYỆT ĐỐI KHÔNG: Viết lời dẫn lan man, bình phẩm triết lý chung chung không ăn nhập gì với hình ảnh đang diễn ra trong video!
+   - Lời thoại BẮT BUỘC PHẢI THUYẾT MINH CHÍNH XÁC VỀ HÀNH ĐỘNG/SỰ KIỆN đang diễn ra trên màn hình tại mốc thời gian đó kết hợp dẫn dắt cốt truyện sâu sắc.
+   - Khi video chiếu cảnh nhân vật cầm tờ tiền viết số điện thoại cầu cứu, lời thoại phải nói đúng về hành động viết số điện thoại lên tờ tiền đó.
 
 3. **CÂN CHỈNH ĐỘ DÀI LỜI THOẠI KHỚP THỜI LƯỢNG (WORD COUNT CALIBRATION)**:
-   - Tốc độ đọc chuẩn của giọng 'Cô Gái Hoạt Ngôn' là khoảng 3.1 từ/giây.
+   - Tốc độ đọc chuẩn Review Phim là khoảng 3.15 từ/giây.
    - Vì mỗi phân cảnh dài khoảng {avg_seg_dur:.1f} giây, mỗi đoạn `script` BẮT BUỘC PHẢI DÀI TỪ {min_words} ĐẾN {max_words} TỪ.
    - Không được viết quá ngắn (dưới {min_words} từ) gây trống vắng, cũng không viết quá dài (trên {max_words} từ) làm giọng đọc bị trôi cảnh!
    - Không dùng dấu ngoặc kép " bên trong script (dùng dấu nháy đơn ' hoặc không dùng) để đảm bảo JSON hợp lệ 100%.
@@ -563,7 +758,7 @@ Bạn PHẢI trả về duy nhất một JSON Array hợp lệ gồm đúng {act
     "end_time": "{format_seconds_to_mmss(act_st + avg_seg_dur)}",
     "visual_action": "Mô tả hình ảnh cụ thể đang chiếu trên màn hình tại mốc thời gian này",
     "title": "Tiêu đề phân cảnh",
-    "script": "Lời thuyết minh chuẩn phong cách Review Phim, nói trực tiếp về hành động trong khung hình..."
+    "script": "Lời thuyết minh chuẩn phong cách Não Động Review, liền mạch, sâu sắc và khớp 100% khung hình..."
   }}
 ]
 """
@@ -808,58 +1003,119 @@ def render_synced_recap_pipeline(
     aspect_ratio: str = "16:9",
     bgm_volume: float = 0.12,
     voice_volume: float = 1.60,
-    sync_mode: str = "smart_motion",  # "smart_motion" hoặc "voice_paced"
+    sync_mode: str = "smart_motion",  # "smart_motion", "voice_paced", "keep_original"
     burn_subtitles: bool = False,
-    recap_mode: str = "movie_recap",  # "movie_recap" hoặc "votritv_comedy"
+    recap_mode: str = "movie_recap",  # "movie_recap", "naodong_review", "votritv_comedy"
     canvas_color: str = "0x94A48A",   # Xanh rêu pastel chuẩn kênh @78votritv
     footer_text: str = "",
     custom_bgm_path: str = None,
+    mirror_flip: bool = False,
+    cinematic_letterbox: bool = False,
+    crop_bottom_sub_pct: float = 0.0,
+    color_enhance: bool = True,
+    logo_watermark_path: Optional[str] = None,
+    voice_speed: float = 1.0,
+    voice_engine: str = "capcut",
+    ref_audio_path: Optional[str] = None,
+    ref_start_sec: float = 5.0,
+    ref_duration_sec: float = 8.0,
     progress_callback=None
 ) -> tuple:
     """
-    Quy trình Dựng Video Recap Tốc Độ Cao & Khớp 100% Khung Hình (Parallel Sync Engine):
-    1. Tạo đồng thời đa luồng tất cả giọng đọc AI bằng ThreadPool.
-    2. Cắt và hòa âm song song các phân cảnh video với độ chính xác khung hình (Frame-Accurate Seek).
-    3. Giữ 100% video gốc: Nếu giọng đọc dài hơn cảnh gốc, lặp lại video thêm 1 lần (Instant Replay) để khớp thoại.
-    4. Tùy chọn canvas pastel Vô Tri TV + phụ đề chữ vàng viền đen sắc nét.
+    Quy trình Dựng Video Recap & Review Phim Tốc Độ Cao & Khớp 100% Khung Hình (Parallel GPU Sync Engine):
+    1. Tạo đồng thời đa luồng tất cả giọng đọc AI (CapCut TTS hoặc OmniVoice Zero-Shot Cloning).
+    2. Cắt, lách bản quyền (Lật hình, Cắt sub gốc, Viền đen điện ảnh, Đóng logo tròn góc trái) & hòa âm song song.
+    3. Tự động xuất kèm file phụ đề .SRT đồng bộ từng khung hình.
     Returns: (bool success, str final_path, list broll_items, str merged_audio_path)
     """
     if not segments:
         return False, "Không có phân cảnh nào để xử lý.", [], None
 
+    from utils.hardware_accelerator import get_optimal_h264_encoder_args, detect_best_video_encoder
+
     temp_dir = Path(tempfile.mkdtemp())
     ffmpeg_exe = get_ffmpeg_cmd()
     total_segs = len(segments)
     total_source_dur = get_video_duration(video_path)
+    hw_enc_info = detect_best_video_encoder()
+    hw_enc_args = get_optimal_h264_encoder_args(use_gpu=True, bitrate="8500k", crf="18", preset="veryfast", fps=30)
 
-    # Mặc định voice_type: Thanh Niên Tự Tin cho Vô Tri, Cô Gái Hoạt Ngôn cho Phim
+    # Mặc định voice_type: Thanh Niên Tự Tin cho Vô Tri, Cô Gái Hoạt Ngôn / Nam Trầm cho Phim
     target_voice_id = voice_info.get("id") or voice_info.get("voice_type") or ("BV075_streaming" if recap_mode == "votritv_comedy" else "BV074_streaming")
     target_resource_id = voice_info.get("resource_id") or "7102355709945188865"
 
+    # Chuẩn bị huy hiệu Logo tròn góc trên bên trái (nếu người dùng bật Watermark Logo chuẩn Não Động Review)
+    prepared_badge_png = None
+    if logo_watermark_path and Path(logo_watermark_path).exists():
+        badge_candidate = temp_dir / "channel_badge_circle.png"
+        prepared_badge_png = create_circular_logo_badge(Path(logo_watermark_path), badge_candidate, size=116)
+
     try:
-        # ─── BƯỚC 1: TẠO GIỌNG ĐỌC ĐA LUỒNG SONG SONG (PARALLEL TTS) ───
+        # ─── BƯỚC 1: TẠO GIỌNG ĐỌC ĐA LUỒNG SONG SONG (CAPCUT TTS HOẶC OMNIVOICE CLONING) ───
+        use_omnivoice = False
+        if voice_engine == "omnivoice" and ref_audio_path and Path(ref_audio_path).exists():
+            try:
+                from utils.omnivoice_wrapper import is_omnivoice_available, generate_cloned_voice
+                if is_omnivoice_available():
+                    use_omnivoice = True
+            except Exception:
+                use_omnivoice = False
+
         if progress_callback:
-            progress_callback(10, f"🎙️ Đang tạo giọng đọc AI cho {total_segs} phân cảnh...")
+            eng_label = "OmniVoice Nhân Bản Giọng" if use_omnivoice else "AI Thuyết Minh"
+            progress_callback(10, f"🎙️ Đang tạo giọng đọc ({eng_label}) cho {total_segs} phân cảnh...")
 
         tts_results = {}
+        start_tts_time = time.time()
+
+        def apply_voice_speed_if_needed(in_mp3: Path, speed: float) -> Path:
+            if abs(speed - 1.0) < 0.03 or not in_mp3.exists():
+                return in_mp3
+            spd = max(0.8, min(1.5, float(speed)))
+            fast_mp3 = in_mp3.parent / f"spd_{in_mp3.name}"
+            cmd_spd = [
+                ffmpeg_exe, "-y", "-nostdin",
+                "-i", str(in_mp3),
+                "-af", f"atempo={spd:.2f}",
+                "-c:a", "libmp3lame", "-q:a", "2",
+                str(fast_mp3)
+            ]
+            subprocess.run(cmd_spd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            if fast_mp3.exists() and fast_mp3.stat().st_size > 200:
+                return fast_mp3
+            return in_mp3
+
         def worker_tts(idx_seg):
             idx, s_text = idx_seg
             if not s_text:
                 return idx, False, 0.0, None
             v_mp3 = temp_dir / f"voice_seg_{idx:03d}.mp3"
-            ok, _ = generate_tts(
-                text=s_text,
-                voice_type=target_voice_id,
-                resource_id=target_resource_id,
-                output_path=str(v_mp3)
-            )
+            ok = False
+            if use_omnivoice:
+                from utils.omnivoice_wrapper import generate_cloned_voice
+                ok, _ = generate_cloned_voice(
+                    text=s_text,
+                    ref_audio_path=str(ref_audio_path),
+                    output_path=str(v_mp3),
+                    ref_start_sec=ref_start_sec,
+                    ref_duration_sec=ref_duration_sec
+                )
+            if not ok:
+                ok, _ = generate_tts(
+                    text=s_text,
+                    voice_type=target_voice_id,
+                    resource_id=target_resource_id,
+                    output_path=str(v_mp3)
+                )
             if ok and v_mp3.exists():
+                v_mp3 = apply_voice_speed_if_needed(v_mp3, voice_speed)
                 d = get_audio_duration(v_mp3)
                 return idx, True, d, v_mp3
             return idx, False, 0.0, None
 
         tasks_tts = [(i, seg.get("script", "").strip()) for i, seg in enumerate(segments)]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as executor_tts:
+        tts_workers = 1 if use_omnivoice else min(8, os.cpu_count() or 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=tts_workers) as executor_tts:
             fut_tts_map = {executor_tts.submit(worker_tts, t): t[0] for t in tasks_tts}
             completed_tts = 0
             for fut in concurrent.futures.as_completed(fut_tts_map):
@@ -867,20 +1123,23 @@ def render_synced_recap_pipeline(
                 tts_results[idx] = (has_v, v_dur, v_path)
                 completed_tts += 1
                 if progress_callback:
+                    elapsed_t = time.time() - start_tts_time
+                    rem_t = int((elapsed_t / completed_tts) * (total_segs - completed_tts))
                     pct = int(10 + (completed_tts / total_segs) * 30)
-                    progress_callback(pct, f"🎙️ Đã tạo xong giọng đọc {completed_tts}/{total_segs} phân cảnh...")
+                    progress_callback(pct, f"🎙️ Đã tạo giọng đọc {completed_tts}/{total_segs} phân cảnh | ⏳ Còn lại: ~{rem_t}s...")
 
         voice_part_paths = []
         for i in range(total_segs):
             if i in tts_results and tts_results[i][0] and tts_results[i][2]:
                 voice_part_paths.append(tts_results[i][2])
 
-        # ─── BƯỚC 2: RENDER & HÒA ÂM PHÂN CẢNH ĐA LUỒNG (FRAME-ACCURATE SMART SYNC) ───
+        # ─── BƯỚC 2: RENDER & HÒA ÂM PHÂN CẢNH ĐA LUỒNG (GPU + LÁCH BẢN QUYỀN CHUẨN NÃO ĐỘNG REVIEW) ───
         if progress_callback:
-            progress_callback(45, f"🎞️ Đang render song song {total_segs} phân cảnh với độ chính xác khung hình 100%...")
+            progress_callback(45, f"🎞️ Đang dựng {total_segs} phân cảnh ({hw_enc_info['label']})...")
 
         rendered_scene_map = {}
         broll_item_map = {}
+        scene_durations_map = {}
         font_footer_file = get_system_font("condensed")
         font_sub_file = get_system_font("bold")
 
@@ -891,10 +1150,10 @@ def render_synced_recap_pipeline(
             en_sec = float(seg.get("end_sec", st_sec + 4.0))
             if en_sec <= st_sec:
                 en_sec = st_sec + 4.0
-            orig_clip_dur = max(0.6, min(35.0, en_sec - st_sec))
+            orig_clip_dur = max(0.6, min(40.0, en_sec - st_sec))
 
             # 1. Trích xuất chính xác phân đoạn video gốc (đảm bảo đủ độ dài bao phủ lời thoại)
-            target_clip_dur = round(voice_dur + 0.30, 2) if (has_voice and voice_dur > 0) else orig_clip_dur
+            target_clip_dur = round(voice_dur + 0.25, 2) if (has_voice and voice_dur > 0) else orig_clip_dur
             cut_extract_dur = max(orig_clip_dur, target_clip_dur + 0.5) if (has_voice and voice_dur > 0) else orig_clip_dur
 
             raw_subclip_path = temp_dir / f"raw_sub_{i:03d}.mp4"
@@ -926,32 +1185,26 @@ def render_synced_recap_pipeline(
 
             if has_voice and voice_dur > 0:
                 if recap_mode == "votritv_comedy":
-                    # Chế độ Vô Tri: Lặp lại video thêm 1 lần (hoặc đủ số lần) nếu thoại dài hơn clip
                     if voice_dur > orig_clip_dur:
                         repeat_cnt = max(1, math.ceil((voice_dur + 0.25) / orig_clip_dur) - 1)
                         final_clip_dur = round(max(voice_dur + 0.35, orig_clip_dur * (repeat_cnt + 1)), 2)
                     else:
                         final_clip_dur = round(max(orig_clip_dur, voice_dur + 0.25), 2)
                 elif sync_mode == "keep_original":
-                    # Giữ nguyên thời lượng phân cảnh gốc (chấp nhận khoảng nghỉ giữa các câu)
                     final_clip_dur = round(max(orig_clip_dur, target_clip_dur), 2)
                 elif sync_mode == "voice_paced":
-                    # THOẠI LIÊN TỤC (Voice-Paced Cut): Video cắt vừa khít 100% câu nói (+ 0.3s đệm), triệt tiêu hoàn toàn khoảng lặng chết
                     final_clip_dur = target_clip_dur
                     setpts_filter = "setpts=PTS-STARTPTS"
                 else:
-                    # SMART MOTION ALIGNMENT (Khuyên dùng): Co giãn vi mô 0.85x - 1.25x vừa khít câu thoại, thoại nối tiếp mượt mà
                     speed_ratio = orig_clip_dur / target_clip_dur
                     if 0.85 <= speed_ratio <= 1.25:
                         setpts_filter = f"setpts={(1.0 / speed_ratio):.4f}*(PTS-STARTPTS)"
                     elif speed_ratio > 1.25:
-                        # Video gốc dài hơn thoại: tăng tốc nhẹ 1.15x để giữ nhiều hình ảnh hơn và khớp gọn theo thoại
                         setpts_filter = "setpts=0.8696*(PTS-STARTPTS)"
                     else:
                         setpts_filter = "setpts=PTS-STARTPTS"
                     final_clip_dur = target_clip_dur
 
-                # Xử lý lặp nếu video trích xuất chạm mốc cuối file video gốc
                 if (st_sec + final_clip_dur) > total_source_dur and total_source_dur > 0:
                     avail_dur = max(0.5, total_source_dur - st_sec)
                     if final_clip_dur > avail_dur:
@@ -961,7 +1214,19 @@ def render_synced_recap_pipeline(
 
             scene_out_path = temp_dir / f"scene_{i:03d}.mp4"
 
-            # 3. Xây dựng Filter Graph hình ảnh theo phong cách Canvas
+            # 3. Xây dựng Chuỗi Filter Lách Bản Quyền & Khung Hình Điện Ảnh Chuẩn Não Động Review
+            pre_fx_list = []
+            if crop_bottom_sub_pct > 0.01:
+                # Cắt bỏ phần đáy có chứa phụ đề gốc của phim (ví dụ 8% đáy) và giữ cân đối khung hình
+                keep_h_ratio = max(0.75, 1.0 - float(crop_bottom_sub_pct))
+                pre_fx_list.append(f"crop=iw*{keep_h_ratio:.3f}:ih*{keep_h_ratio:.3f}:(iw-iw*{keep_h_ratio:.3f})/2:0")
+            if mirror_flip:
+                pre_fx_list.append("hflip")
+            if color_enhance:
+                pre_fx_list.append("eq=contrast=1.04:saturation=1.05:brightness=0.01")
+
+            pre_fx_str = (",".join(pre_fx_list) + ",") if pre_fx_list else ""
+
             is_votritv_canvas = (aspect_ratio == "9:16_votritv") or (recap_mode == "votritv_comedy" and "9:16" in aspect_ratio)
 
             if is_votritv_canvas:
@@ -976,21 +1241,21 @@ def render_synced_recap_pipeline(
                     footer_filter = f"[v_mid]drawtext=text='{clean_footer}'{f_footer_clause}:fontcolor=white:fontsize=58:x=(w-text_w)/2:y=1540:shadowcolor=black@0.35:shadowx=2:shadowy=2[v_base]"
                     base_v_filter = (
                         f"color=c={safe_canvas}:s=1080x1920:r=30[bg];"
-                        f"[0:v]scale=1080:-2:flags=lanczos,{setpts_filter}[fg];"
+                        f"[0:v]{pre_fx_str}scale=1080:-2:flags=lanczos,{setpts_filter}[fg];"
                         f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v_mid];"
                         f"{footer_filter}"
                     )
                 else:
                     base_v_filter = (
                         f"color=c={safe_canvas}:s=1080x1920:r=30[bg];"
-                        f"[0:v]scale=1080:-2:flags=lanczos,{setpts_filter}[fg];"
+                        f"[0:v]{pre_fx_str}scale=1080:-2:flags=lanczos,{setpts_filter}[fg];"
                         f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v_base]"
                     )
                 sub_y_pos = "1200"
                 font_sz = "48"
             elif aspect_ratio == "9:16":
                 base_v_filter = (
-                    f"[0:v]split=2[bg_src][fg_src];"
+                    f"[0:v]{pre_fx_str}split=2[bg_src][fg_src];"
                     f"[bg_src]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,boxblur=25:2,eq=brightness=-0.03:contrast=1.05[bg];"
                     f"[fg_src]scale=1404:-2:flags=lanczos,crop=1080:ih:(iw-1080)/2:0,unsharp=3:3:0.6:3:3:0.3[fg];"
                     f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps=30,{setpts_filter}[v_base]"
@@ -998,8 +1263,13 @@ def render_synced_recap_pipeline(
                 sub_y_pos = "h-360"
                 font_sz = "44"
             else:
+                letterbox_clause = ""
+                if cinematic_letterbox:
+                    # Viền đen điện ảnh 2.35:1 trên và dưới chuẩn khung hình kênh Não Động Review
+                    letterbox_clause = ",drawbox=x=0:y=0:w=iw:h=68:color=black@1:t=fill,drawbox=x=0:y=ih-68:w=iw:h=68:color=black@1:t=fill"
                 base_v_filter = (
-                    f"[0:v]scale=1920:1080:force_original_aspect_ratio=increase:flags=lanczos,crop=1920:1080,unsharp=5:5:0.8:3:3:0.4,fps=30,{setpts_filter}[v_base]"
+                    f"[0:v]{pre_fx_str}scale=1920:1080:force_original_aspect_ratio=increase:flags=lanczos,"
+                    f"crop=1920:1080,unsharp=5:5:0.8:3:3:0.4{letterbox_clause},fps=30,{setpts_filter}[v_base]"
                 )
                 sub_y_pos = "h-140"
                 font_sz = "36"
@@ -1013,12 +1283,19 @@ def render_synced_recap_pipeline(
                 escaped_sub = wrapped_sub.replace("\n", "\\\n").replace("%", "\\%")
                 f_sub_esc = font_sub_file.replace(" ", "\\ ") if font_sub_file else ""
                 f_sub_clause = f":fontfile=\\'{f_sub_esc}\\'" if f_sub_esc else ""
-                v_filter_full = (
+                v_sub_stage = (
                     f"{base_v_filter};"
-                    f"[v_base]drawtext=text='{escaped_sub}'{f_sub_clause}:fontcolor=yellow:bordercolor=black:borderw=5:fontsize={font_sz}:x=(w-text_w)/2:y={sub_y_pos}:shadowcolor=black@0.75:shadowx=3:shadowy=3[v_out]"
+                    f"[v_base]drawtext=text='{escaped_sub}'{f_sub_clause}:fontcolor=yellow:bordercolor=black:borderw=5:fontsize={font_sz}:x=(w-text_w)/2:y={sub_y_pos}:shadowcolor=black@0.75:shadowx=3:shadowy=3[v_sub]"
                 )
             else:
-                v_filter_full = f"{base_v_filter};[v_base]null[v_out]"
+                v_sub_stage = f"{base_v_filter};[v_base]null[v_sub]"
+
+            # Đính Huy Hiệu Logo Tròn Góc Trái-Trên (Chuẩn Não Động Review)
+            if prepared_badge_png and prepared_badge_png.exists():
+                badge_esc = str(prepared_badge_png).replace("\\", "/").replace(":", "\\:")
+                v_filter_full = f"{v_sub_stage};movie='{badge_esc}'[logo];[v_sub][logo]overlay=42:22[v_out]"
+            else:
+                v_filter_full = f"{v_sub_stage};[v_sub]null[v_out]"
 
             # Render clip với stream_loop (lặp lại nếu thoại dài hơn video) và adelay cho voice
             input_v_target = raw_subclip_path if (raw_subclip_path.exists() and raw_subclip_path.stat().st_size > 0) else video_path
@@ -1033,18 +1310,11 @@ def render_synced_recap_pipeline(
                     "-filter_complex",
                     f"{v_filter_full};"
                     f"[0:a]volume={bgm_volume:.2f},asetpts=PTS-STARTPTS,aresample=48000:async=1000:first_pts=0[bgm];"
-                    f"[1:a]volume={voice_volume:.2f},adelay=150|150,asetpts=PTS-STARTPTS,aresample=48000:async=1000:first_pts=0[voice];"
+                    f"[1:a]volume={voice_volume:.2f},adelay=120|120,asetpts=PTS-STARTPTS,aresample=48000:async=1000:first_pts=0[voice];"
                     f"[bgm][voice]amix=inputs=2:duration=first:dropout_transition=0[a_out]",
                     "-map", "[v_out]",
                     "-map", "[a_out]",
-                    "-r", "30",
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "18",
-                    "-b:v", "10000k",
-                    "-maxrate", "14000k",
-                    "-bufsize", "20000k",
-                    "-pix_fmt", "yuv420p",
+                    *hw_enc_args,
                     "-c:a", "aac",
                     "-b:a", "192k",
                     "-ar", "48000",
@@ -1063,14 +1333,7 @@ def render_synced_recap_pipeline(
                     f"[0:a]volume={bgm_volume:.2f},asetpts=PTS-STARTPTS,aresample=48000:async=1000:first_pts=0[a_out]",
                     "-map", "[v_out]",
                     "-map", "[a_out]",
-                    "-r", "30",
-                    "-c:v", "libx264",
-                    "-preset", "veryfast",
-                    "-crf", "18",
-                    "-b:v", "10000k",
-                    "-maxrate", "14000k",
-                    "-bufsize", "20000k",
-                    "-pix_fmt", "yuv420p",
+                    *hw_enc_args,
                     "-c:a", "aac",
                     "-b:a", "192k",
                     "-ar", "48000",
@@ -1087,7 +1350,6 @@ def render_synced_recap_pipeline(
                 pass
 
             if scene_out_path.exists() and scene_out_path.stat().st_size > 1000:
-                # Kiểm tra tính toàn vẹn tránh file lỗi moov atom
                 chk = subprocess.run([ffmpeg_exe, "-v", "error", "-i", str(scene_out_path)], capture_output=True, text=True, timeout=5)
                 if "moov atom not found" not in chk.stderr and "Invalid data" not in chk.stderr:
                     return i, str(scene_out_path), {
@@ -1099,6 +1361,7 @@ def render_synced_recap_pipeline(
 
         max_workers_render = min(os.cpu_count() or 4, 4)
         rendered_count = 0
+        start_render_all = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_render) as executor_render:
             fut_render_map = {executor_render.submit(worker_render_scene, i): i for i in range(total_segs)}
             for fut in concurrent.futures.as_completed(fut_render_map):
@@ -1106,16 +1369,30 @@ def render_synced_recap_pipeline(
                 if sc_path:
                     rendered_scene_map[i_idx] = sc_path
                     broll_item_map[i_idx] = broll_info
+                    scene_durations_map[i_idx] = broll_info["duration_sec"]
                 rendered_count += 1
                 if progress_callback:
+                    elapsed_r = time.time() - start_render_all
+                    avg_r = elapsed_r / rendered_count
+                    rem_r = int(avg_r * (total_segs - rendered_count))
+                    el_m, el_s = divmod(int(elapsed_r), 60)
+                    rm_m, rm_s = divmod(rem_r, 60)
                     pct = int(45 + (rendered_count / total_segs) * 45)
-                    progress_callback(pct, f"🎞️ Đã dựng xong {rendered_count}/{total_segs} phân cảnh...")
+                    progress_callback(
+                        pct,
+                        f"🎞️ Đã dựng {rendered_count}/{total_segs} phân cảnh ({int(rendered_count/total_segs*100)}%) | "
+                        f"⏱️ Đã chạy: {el_m:02d}:{el_s:02d} | ⏳ Còn lại ước tính: ~{rm_m:02d}:{rm_s:02d}"
+                    )
 
         rendered_scene_paths = [rendered_scene_map[i] for i in range(total_segs) if i in rendered_scene_map]
         broll_items_for_capcut = [broll_item_map[i] for i in range(total_segs) if i in broll_item_map]
 
         if not rendered_scene_paths:
             return False, "Không thể dựng được phân cảnh nào hợp lệ.", [], None
+
+        # Xuất file phụ đề .SRT đồng bộ thời gian thực tế
+        srt_output_path = output_video_path.with_suffix(".srt")
+        export_synced_srt_file(segments, scene_durations_map, srt_output_path)
 
         # ─── BƯỚC 3: GHÉP NỐI TOÀN BỘ PHÂN CẢNH THÀNH VIDEO MASTER ───
         if progress_callback:
