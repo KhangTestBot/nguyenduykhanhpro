@@ -1368,11 +1368,12 @@ def render_clips(
             }
 
         completed = 0
+        start_render_all = time.time()
         if status_text:
             if is_fast_mode:
-                status_text.markdown(f"**⚡ Đang cắt siêu tốc (Stream Copy) {n_clips} clip...**")
+                status_text.markdown(f"**⚡ Đang cắt siêu tốc (Stream Copy) {n_clips} clip... (Đang khởi động)**")
             else:
-                status_text.markdown(f"**🚀 Đang nén GPU tối ưu {n_clips} clip ({max_workers} luồng song song)...**")
+                status_text.markdown(f"**🚀 Đang nén GPU tối ưu {n_clips} clip ({max_workers} luồng song song)... (Đang khởi động)**")
 
         # Chạy đa luồng theo cấu hình tối ưu
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
@@ -1383,8 +1384,25 @@ def render_clips(
                     res = future.result()
                     results.append(res)
                     completed += 1
+                    
+                    elapsed = time.time() - start_render_all
+                    avg_time_per_clip = elapsed / completed
+                    remaining_clips = n_clips - completed
+                    est_remaining_sec = int(remaining_clips * avg_time_per_clip)
+                    
+                    elapsed_min, elapsed_sec = divmod(int(elapsed), 60)
+                    rem_min, rem_sec = divmod(est_remaining_sec, 60)
+                    pct = int((completed / n_clips) * 100)
+                    
                     if progress_bar:
                         progress_bar.progress(completed / n_clips)
+                    if status_text:
+                        mode_title = "⚡ Siêu Tốc" if is_fast_mode else f"🚀 GPU T4 ({max_workers} luồng)"
+                        rem_str = f"{rem_min}p {rem_sec:02d}s" if rem_min > 0 else f"{rem_sec}s"
+                        status_text.markdown(
+                            f"**{mode_title} | Đã xong: {completed}/{n_clips} clip ({pct}%)**\n\n"
+                            f"⏱️ Đã chạy: `{elapsed_min:02d}:{elapsed_sec:02d}` | ⏳ **Ước tính còn lại: ~`{rem_str}`**"
+                        )
                 except Exception as thread_err:
                     executor.shutdown(wait=False, cancel_futures=True)
                     with PROCESSES_LOCK:
